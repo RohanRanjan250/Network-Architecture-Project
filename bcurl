@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+import argparse, random, socket, sys, time
+
+PREFACE = b"BHTTP/1\n"
+HEADERS, DATA, GOAWAY = 0x01, 0x02, 0x03
+END = 0x01
+TYPE_NAMES = {HEADERS: "HEADERS", DATA: "DATA", GOAWAY: "GOAWAY"}
+GOAWAY_CODES = {0: "NO_ERROR", 1: "PROTOCOL_ERROR", 2: "FRAME_TOO_LARGE",
+                3: "TIMEOUT", 4: "INTERNAL_ERROR"}
+
+STATIC = ["host", "user-agent", "accept", "content-type", "content-length",
+          "last-modified", "date", "server", "cache-control", "connection"]
+INDEX = {name: i + 1 for i, name in enumerate(STATIC)}
+METHOD_CODES = {"GET": 1, "HEAD": 2, "POST": 3, "PUT": 4, "DELETE": 5, "OPTIONS": 6}
+
+MAX_FRAME = 1 << 20
+DUMP_LIMIT = 256
+READ_TIMEOUT = 30.0
+BACKOFF_BASE = 0.2
+BACKOFF_CAP = 8.0
+IDEMPOTENT = {"GET", "HEAD", "PUT", "DELETE", "OPTIONS"}
+RETRY_STATUS = {500, 502, 503, 504}
+VERBOSE = False
+DUMP_ALL = False
+
+
+class ProtocolError(Exception):
+    pass
+
+
+def err(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def hexdump(data, prefix="    "):
+    shown = data if DUMP_ALL else data[:DUMP_LIMIT]
+    for off in range(0, len(shown), 16):
+        row = shown[off:off + 16]
+        hx = " ".join(f"{b:02x}" for b in row[:8]) + "  " + " ".join(f"{b:02x}" for b in row[8:])
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        err(f"{prefix}{off:08x}  {hx:<48}  |{text}|")
+    if len(data) > len(shown):
+        err(f"{prefix}... {len(data) - len(shown)} more bytes (use --dump-all)")
+
+
+def frame(ftype, flags, rid, payload=b""):
+    return (len(payload).to_bytes(3, "big") + bytes([ftype, flags])
+            + rid.to_bytes(3, "big") + payload)
+
+
+def encode_fields(fields):
+    out = bytearray()
+    for name, value in fields:
+        v = value.encode()
+        if name in INDEX:
+            out += bytes([INDEX[name]])
+        else:
+            n = name.encode("ascii")
+            if not 1 <= len(n) <= 255:
+                raise ValueError(f"header name {name!r} must be 1-255 bytes")
+            out += b"\x00" + bytes([len(n)]) + n
+        if len(v) > 0xFFFF:
+            raise ValueError(f"header {name} value longer than 65535 bytes")
+        out += len(v).to_bytes(2, "big") + v
+    return bytes(out)
+
+
+def decode_fields(p, i):
+    fields = []
+    while i < len(p):
+        first = p[i]; i += 1
+        if 1 <= first <= 10:
+            name = STATIC[first - 1]
+        elif first == 0:
+            if i >= len(p):
+                raise ProtocolError("header block ends inside a literal name")
+            n = p[i]; i += 1
+            if n == 0 or i + n > len(p):
+                raise ProtocolError("bad literal name length")
+            name = p[i:i + n].decode("ascii", "replace").lower()
+            i += n
+        else:
+            raise ProtocolError(f"reserved field byte 0x{first:02X}")
+        if i + 2 > len(p):
+            raise ProtocolError("header block ends inside a value length")
+        vlen = int.from_bytes(p[i:i + 2], "big"); i += 2
+        if i + vlen > len(p):
+            raise ProtocolError("header block ends inside a value")
+        fields.append((name, p[i:i + vlen].decode("utf-8", "replace")))
+        i += vlen
+    return fields
+
+
+def describe(direction, ftype, flags, rid, payload, fields=None, extra=""):
+    if not VERBOSE:
+        return
+    name = TYPE_NAMES.get(ftype, f"UNKNOWN(0x{ftype:02X})")
+    fl = "END" if flags & END else "-"
+    err(f"{direction} {name} id={rid} length={len(payload)} flags={fl}{extra}")
+    for k, v in fields or []:
+        err(f"    {k}: {v}")
+    hexdump(frame(ftype, flags, rid, payload))
+
+
+class Response:
+    def __init__(self, url):
+        self.url, self.attempts = url, 0
+        self.reset()
+
+    def reset(self):
+        self.status, self.headers, self.retrying = None, {}, False
+        self.chunks, self.received, self.done = [], 0, False
+
+
+class Wake(Exception):
+    pass
+
+
+class Client:
+    def __init__(self, sock):
+        self.sock, self.buf, self.wake_at = sock, bytearray(), None
+
+    def ensure(self, n):
+        while len(self.buf) < n:
+            timeout = READ_TIMEOUT
+            if self.wake_at is not None:
+                timeout = min(timeout, self.wake_at - time.monotonic())
+                if timeout <= 0:
+                    raise Wake()
+            self.sock.settimeout(timeout)
+            try:
+                data = self.sock.recv(65536)
+            except socket.timeout:
+                if self.wake_at is not None and time.monotonic() >= self.wake_at:
+                    raise Wake()
+                raise ProtocolError("timed out waiting for the server")
+            except ConnectionResetError:
+                raise ProtocolError("connection reset by server")
+            if not data:
+                raise ProtocolError("server closed the connection")
+            self.buf += data
+
+    def take(self, n):
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def read_exact(self, n):
+        self.ensure(n)
+        return self.take(n)
+
+    def read_frame(self):
+        self.ensure(8)
+        length = int.from_bytes(self.buf[0:3], "big")
+        if length > MAX_FRAME:
+            raise ProtocolError(f"frame of {length} bytes exceeds the {MAX_FRAME} limit")
+        self.ensure(8 + length)
+        h = self.take(8)
+        return h[3], h[4], int.from_bytes(h[5:8], "big"), self.take(length)
+
+
+def backoff(attempt, retry_after=None):
+    if retry_after is not None:
+        return min(BACKOFF_CAP, retry_after)
+    delay = min(BACKOFF_CAP, BACKOFF_BASE * 2 ** attempt)
+    return random.uniform(delay / 2, delay)
+
+
+def connect(host, port, retries):
+    for attempt in range(retries + 1):
+        try:
+            return socket.create_connection((host, port), timeout=READ_TIMEOUT)
+        except OSError as e:
+            if attempt == retries:
+                raise
+            d = backoff(attempt)
+            if VERBOSE:
+                err(f"* connect failed ({e}); retry {attempt + 1}/{retries} in {d:.2f}s")
+            time.sleep(d)
+
+
+def parse_url(url):
+    if "://" in url:
+        scheme, url = url.split("://", 1)
+        if scheme.lower() != "bhttp":
+            raise ValueError(f"unsupported scheme {scheme!r}; use bhttp:// or host:port/path")
+    hostport, slash, path = url.partition("/")
+    host, _, port = hostport.rpartition(":")
+    if not host:
+        host, port = hostport, "9000"
+    if not port.isdigit():
+        raise ValueError(f"bad port in {url!r}")
+    return host.strip("[]"), int(port), "/" + path
+
+
+def main():
+    global VERBOSE, DUMP_ALL
+    ap = argparse.ArgumentParser(prog="bcurl", description="BHTTP/1 client")
+    ap.add_argument("urls", nargs="+", metavar="host:port/path")
+    ap.add_argument("-v", "--verbose", action="store_true", help="hexdump every frame to stderr")
+    ap.add_argument("-I", "--head", action="store_true", help="send HEAD instead of GET")
+    ap.add_argument("-X", "--method", choices=list(METHOD_CODES), help="request method")
+    ap.add_argument("-H", "--header", action="append", default=[], metavar="'name: value'")
+    ap.add_argument("--dump-all", action="store_true", help="do not truncate long frames in -v")
+    ap.add_argument("--grease", action="store_true",
+                    help="send an unknown frame type before every request")
+    ap.add_argument("--retry", type=int, default=3, metavar="N",
+                    help="retries for a failed connect or a 500/502/503/504 (default 3, 0 = off)")
+    opts = ap.parse_args()
+    VERBOSE, DUMP_ALL = opts.verbose, opts.dump_all
+
+    try:
+        targets = [parse_url(u) for u in opts.urls]
+    except ValueError as e:
+        err(f"bcurl: {e}")
+        return 1
+    host, port = targets[0][0], targets[0][1]
+    if any((h, p) != (host, port) for h, p, _ in targets):
+        err("bcurl: every URL must use the same host:port - bcurl never opens a second connection")
+        return 1
+
+    extra = []
+    for h in opts.header:
+        name, colon, value = h.partition(":")
+        if not colon or not name.strip():
+            err(f"bcurl: bad header {h!r}, expected 'name: value'")
+            return 1
+        extra.append((name.strip().lower(), value.strip()))
+    method = opts.method or ("HEAD" if opts.head else "GET")
+
+    try:
+        sock = connect(host, port, opts.retry)
+    except OSError as e:
+        err(f"bcurl: cannot connect to {host}:{port}: {e}")
+        return 2
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    if VERBOSE:
+        err(f"* connected to {host}:{port} - one TCP connection for {len(targets)} request(s)")
+        err("> PREFACE")
+        hexdump(PREFACE)
+
+    fields = [("host", f"{host}:{port}"), ("user-agent", "bcurl/1.0"), ("accept", "*/*")]
+    seen = {k for k, _ in extra}
+    fields = [f for f in fields if f[0] not in seen] + extra
+
+    def request(rid, path):
+        p = path.encode()
+        block = bytes([METHOD_CODES[method]]) + len(p).to_bytes(2, "big") + p + encode_fields(fields)
+        out = b""
+        if opts.grease:
+            junk = b"bcurl greases the wire"
+            describe(">", 0x7A, 0, rid, junk, extra="  (unknown on purpose)")
+            out += frame(0x7A, 0, rid, junk)
+        describe(">", HEADERS, END, rid, block, [(":method", method), (":path", path)] + fields)
+        return out + frame(HEADERS, END, rid, block)
+
+    slots = [Response(path) for _, _, path in targets]
+    owner = {}
+    out = bytearray(PREFACE)
+    next_id = 1
+    for i, r in enumerate(slots):
+        out += request(next_id, r.url)
+        owner[next_id] = i
+        next_id += 1
+    sock.sendall(out)
+
+    can_retry = method in IDEMPOTENT
+    pending = []
+    nxt = 0
+    stdout = sys.stdout.buffer
+    client = Client(sock)
+    try:
+        pre = client.read_exact(8)
+        if pre != PREFACE:
+            hint = " (it answered in text HTTP)" if pre.startswith(b"HTTP/") else ""
+            raise ProtocolError(f"not a BHTTP/1 server{hint}: preface {pre!r}")
+        if VERBOSE:
+            err("< PREFACE")
+            hexdump(pre)
+        while nxt < len(slots):
+            pending.sort()
+            client.wake_at = pending[0][0] if pending else None
+            if pending and time.monotonic() >= pending[0][0]:
+                _, i = pending.pop(0)
+                rid, next_id = next_id, next_id % 0xFFFFFF + 1
+                owner[rid] = i
+                sock.settimeout(READ_TIMEOUT)
+                sock.sendall(request(rid, slots[i].url))
+                continue
+            try:
+                ftype, flags, rid, payload = client.read_frame()
+            except Wake:
+                continue
+            if ftype == GOAWAY:
+                code = int.from_bytes(payload[:2], "big") if len(payload) >= 2 else -1
+                reason = payload[2:].decode("utf-8", "replace")
+                describe("<", ftype, flags, rid, payload,
+                         [("code", GOAWAY_CODES.get(code, str(code))), ("reason", reason)])
+                raise ProtocolError(f"server sent GOAWAY {GOAWAY_CODES.get(code, code)}: {reason}")
+            if ftype not in (HEADERS, DATA):
+                describe("<", ftype, flags, rid, payload, extra="  (unknown type, skipped)")
+                continue
+            i = owner.get(rid)
+            r = slots[i] if i is not None else None
+            if r is None or r.done:
+                describe("<", ftype, flags, rid, payload, extra="  (no open request, discarded)")
+                continue
+            if ftype == HEADERS:
+                if len(payload) < 2:
+                    raise ProtocolError("response header block shorter than a status")
+                r.status = int.from_bytes(payload[:2], "big")
+                hfields = decode_fields(payload, 2)
+                r.headers = dict(hfields)
+                r.retrying = can_retry and r.status in RETRY_STATUS and r.attempts < opts.retry
+                describe("<", ftype, flags, rid, payload, [(":status", str(r.status))] + hfields)
+            else:
+                if r.status is None:
+                    raise ProtocolError(f"DATA before HEADERS on id {rid}")
+                describe("<", ftype, flags, rid, payload)
+                if not r.retrying:
+                    r.chunks.append(payload)
+                    r.received += len(payload)
+            if flags & END:
+                del owner[rid]
+                if r.retrying:
+                    ra = r.headers.get("retry-after", "")
+                    d = backoff(r.attempts, float(ra) if ra.isdigit() else None)
+                    r.attempts += 1
+                    if VERBOSE:
+                        err(f"* {r.url} -> {r.status}; retry {r.attempts}/{opts.retry} "
+                            f"in {d:.2f}s on the same connection")
+                    r.reset()
+                    pending.append((time.monotonic() + d, i))
+                    continue
+                r.done = True
+                cl = r.headers.get("content-length")
+                if method != "HEAD" and cl is not None and cl.isdigit() and int(cl) != r.received:
+                    raise ProtocolError(f"id {rid}: content-length {cl} but {r.received} bytes arrived")
+            while nxt < len(slots):
+                cur = slots[nxt]
+                if cur.chunks:
+                    stdout.write(b"".join(cur.chunks))
+                    stdout.flush()
+                    cur.chunks.clear()
+                if not cur.done:
+                    break
+                nxt += 1
+    except ProtocolError as e:
+        err(f"bcurl: {e}")
+        sock.close()
+        return 2
+    sock.close()
+
+    worst = 0
+    for r in slots:
+        if VERBOSE or r.status >= 400:
+            tries = f", after {r.attempts} retr{'y' if r.attempts == 1 else 'ies'}" if r.attempts else ""
+            err(f"* {method} {r.url} -> {r.status} ({r.received} bytes{tries})")
+        worst = max(worst, r.status)
+    if VERBOSE:
+        err(f"* {len(slots)} response(s) on 1 connection")
+    return 5 if worst >= 500 else 4 if worst >= 400 else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

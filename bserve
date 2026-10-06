@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+import argparse, mimetypes, os, selectors, socket, sys, threading, time
+from email.utils import formatdate
+
+PREFACE = b"BHTTP/1\n"
+HEADERS, DATA, GOAWAY = 0x01, 0x02, 0x03
+END = 0x01
+NO_ERROR, PROTOCOL_ERROR, FRAME_TOO_LARGE, TIMEOUT, INTERNAL_ERROR = range(5)
+
+STATIC = ["host", "user-agent", "accept", "content-type", "content-length",
+          "last-modified", "date", "server", "cache-control", "connection"]
+INDEX = {name: i + 1 for i, name in enumerate(STATIC)}
+METHODS = {1: "GET", 2: "HEAD", 3: "POST", 4: "PUT", 5: "DELETE", 6: "OPTIONS"}
+REASON = {200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
+          413: "Content Too Large", 431: "Request Header Fields Too Large",
+          500: "Internal Server Error", 501: "Not Implemented", 503: "Service Unavailable"}
+
+MAX_FRAME = 1 << 20
+MAX_HEADER_BLOCK = 16 * 1024
+MAX_BODY = 1 << 20
+MAX_OPEN = 100
+CHUNK = 16 * 1024
+IDLE_TIMEOUT = 30.0
+FRAME_TIMEOUT = 10.0
+GREASE = False
+FAIL_FIRST = 0
+FAIL_LOCK = threading.Lock()
+DISCARD = object()
+
+
+def log(*a):
+    print(time.strftime("[%H:%M:%S]"), *a, file=sys.stderr, flush=True)
+
+
+class Malformed(Exception):
+    pass
+
+
+class Closed(Exception):
+    pass
+
+
+class Timeout(Exception):
+    def __init__(self, idle):
+        self.idle = idle
+
+
+def frame(ftype, flags, rid, payload=b""):
+    return (len(payload).to_bytes(3, "big") + bytes([ftype, flags])
+            + rid.to_bytes(3, "big") + payload)
+
+
+def encode_fields(fields):
+    out = bytearray()
+    for name, value in fields:
+        v = value.encode()
+        if name in INDEX:
+            out += bytes([INDEX[name]])
+        else:
+            n = name.encode("ascii")
+            out += b"\x00" + bytes([len(n)]) + n
+        out += len(v).to_bytes(2, "big") + v
+    return bytes(out)
+
+
+def decode_fields(p, i):
+    fields = []
+    while i < len(p):
+        first = p[i]; i += 1
+        if 1 <= first <= 10:
+            name = STATIC[first - 1]
+        elif first == 0:
+            if i >= len(p):
+                raise Malformed("header block ends inside a literal name")
+            n = p[i]; i += 1
+            if n == 0 or i + n > len(p):
+                raise Malformed("bad literal name length")
+            try:
+                name = p[i:i + n].decode("ascii").lower()
+            except UnicodeDecodeError:
+                raise Malformed("literal name is not ASCII")
+            i += n
+        else:
+            raise Malformed(f"reserved field byte 0x{first:02X}")
+        if i + 2 > len(p):
+            raise Malformed("header block ends inside a value length")
+        vlen = int.from_bytes(p[i:i + 2], "big"); i += 2
+        if i + vlen > len(p):
+            raise Malformed("header block ends inside a value")
+        try:
+            fields.append((name, p[i:i + vlen].decode("utf-8")))
+        except UnicodeDecodeError:
+            raise Malformed(f"value of {name} is not UTF-8")
+        i += vlen
+    return fields
+
+
+def decode_request(p):
+    if len(p) < 3:
+        raise Malformed("header block shorter than method + path length")
+    method = p[0]
+    plen = int.from_bytes(p[1:3], "big")
+    if 3 + plen > len(p):
+        raise Malformed("header block ends inside the path")
+    try:
+        path = p[3:3 + plen].decode("utf-8")
+    except UnicodeDecodeError:
+        raise Malformed("path is not UTF-8")
+    if not path.startswith("/") or "\x00" in path:
+        raise Malformed("path must start with /")
+    return method, path, decode_fields(p, 3 + plen)
+
+
+class Request:
+    def __init__(self, rid, method, path, fields):
+        self.rid, self.method, self.path = rid, method, path
+        self.headers = dict(fields)
+        self.body = 0
+
+
+class Connection:
+    ids = 0
+
+    def __init__(self, sock, peer, root):
+        Connection.ids += 1
+        self.id, self.sock, self.peer, self.root = Connection.ids, sock, peer, root
+        self.buf = bytearray()
+        self.open = {}
+        self.served = 0
+
+    def tag(self):
+        return f"conn#{self.id} {self.peer[0]}:{self.peer[1]}"
+
+    def fill(self, deadline):
+        if deadline is None:
+            self.sock.settimeout(IDLE_TIMEOUT)
+        else:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise Timeout(idle=False)
+            self.sock.settimeout(left)
+        try:
+            data = self.sock.recv(65536)
+        except socket.timeout:
+            raise Timeout(idle=deadline is None)
+        except (ConnectionResetError, BrokenPipeError):
+            raise Closed()
+        if not data:
+            raise Closed()
+        self.buf += data
+
+    def read_exact(self, n, deadline):
+        while len(self.buf) < n:
+            self.fill(deadline)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def skip(self, n, deadline):
+        while n:
+            if not self.buf:
+                self.fill(deadline)
+            k = min(n, len(self.buf))
+            del self.buf[:k]
+            n -= k
+
+    def read_header(self):
+        if not self.buf:
+            self.fill(None)
+        deadline = time.monotonic() + FRAME_TIMEOUT
+        h = self.read_exact(8, deadline)
+        return (int.from_bytes(h[0:3], "big"), h[3], h[4],
+                int.from_bytes(h[5:8], "big"), deadline)
+
+    def send(self, data):
+        self.sock.sendall(data)
+
+    def goaway(self, code, reason):
+        log(f"{self.tag()} GOAWAY code={code} {reason}")
+        try:
+            self.send(frame(GOAWAY, 0, 0, code.to_bytes(2, "big") + reason.encode()))
+        except OSError:
+            pass
+
+    def respond(self, rid, status, body=b"", ctype="text/plain; charset=utf-8",
+                extra=(), head_only=False, stream=None, length=None):
+        size = len(body) if stream is None else length
+        fields = [("content-type", ctype), ("content-length", str(size)),
+                  ("date", formatdate(usegmt=True)), ("server", "bserve/1.0")]
+        fields += list(extra)
+        block = status.to_bytes(2, "big") + encode_fields(fields)
+        if GREASE:
+            self.send(frame(0x7A, 0, rid, b"version 2 was here"))
+        no_body = head_only or size == 0
+        self.send(frame(HEADERS, END if no_body else 0, rid, block))
+        if not no_body:
+            if stream is None:
+                for i in range(0, len(body), CHUNK):
+                    part = body[i:i + CHUNK]
+                    last = i + CHUNK >= len(body)
+                    self.send(frame(DATA, END if last else 0, rid, part))
+            else:
+                sent = 0
+                while sent < size:
+                    part = stream.read(min(CHUNK, size - sent))
+                    if not part:
+                        raise OSError("file shrank while sending")
+                    sent += len(part)
+                    self.send(frame(DATA, END if sent >= size else 0, rid, part))
+        self.served += 1
+
+    def error(self, rid, status, message, extra=()):
+        log(f"{self.tag()} id={rid} -> {status} {message}")
+        self.respond(rid, status, (message + "\n").encode(), extra=extra)
+
+    def handle(self, req):
+        global FAIL_FIRST
+        with FAIL_LOCK:
+            fail = FAIL_FIRST > 0
+            FAIL_FIRST -= fail
+        if fail:
+            return self.error(req.rid, 503, "warming up, try again (--fail-first)")
+        name = METHODS.get(req.method)
+        if name is None:
+            return self.error(req.rid, 501, f"unknown method code {req.method}")
+        if name not in ("GET", "HEAD"):
+            return self.error(req.rid, 405, f"{name} not allowed; this server only reads files",
+                              extra=[("allow", "GET, HEAD")])
+        path = req.path.split("?", 1)[0]
+        target = os.path.realpath(os.path.join(self.root, path.lstrip("/")))
+        if target != self.root and not target.startswith(self.root + os.sep):
+            return self.error(req.rid, 404, f"not found: {path}")
+        if os.path.isdir(target):
+            target = os.path.join(target, "index.html")
+        if not os.path.isfile(target):
+            return self.error(req.rid, 404, f"not found: {path}")
+        try:
+            f = open(target, "rb")
+        except OSError:
+            return self.error(req.rid, 404, f"not found: {path}")
+        with f:
+            st = os.fstat(f.fileno())
+            ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+            if ctype.startswith("text/"):
+                ctype += "; charset=utf-8"
+            log(f"{self.tag()} id={req.rid} {name} {req.path} -> 200 {st.st_size}B")
+            self.respond(req.rid, 200, ctype=ctype, head_only=(name == "HEAD"),
+                         stream=f, length=st.st_size,
+                         extra=[("last-modified", formatdate(st.st_mtime, usegmt=True)),
+                                ("cache-control", "max-age=60")])
+
+    def finish(self, req):
+        self.handle(req)
+        return req.headers.get("connection", "").lower() == "close"
+
+    def on_headers(self, rid, flags, payload):
+        if rid in self.open:
+            del self.open[rid]
+            self.error(rid, 400, f"request id {rid} is already open")
+            return False
+        if len(self.open) >= MAX_OPEN:
+            raise Malformed("too many open requests")
+        if len(payload) > MAX_HEADER_BLOCK:
+            self.error(rid, 431, f"header block larger than {MAX_HEADER_BLOCK} bytes")
+        else:
+            try:
+                method, path, fields = decode_request(payload)
+            except Malformed as e:
+                self.error(rid, 400, f"malformed header block: {e}")
+            else:
+                req = Request(rid, method, path, fields)
+                if flags & END:
+                    return self.finish(req)
+                self.open[rid] = req
+                return False
+        if not flags & END:
+            self.open[rid] = DISCARD
+        return False
+
+    def on_data(self, rid, flags, payload):
+        req = self.open.get(rid)
+        if req is None:
+            return False
+        if req is DISCARD:
+            if flags & END:
+                del self.open[rid]
+            return False
+        req.body += len(payload)
+        if req.body > MAX_BODY:
+            self.open[rid] = DISCARD
+            if flags & END:
+                del self.open[rid]
+            self.error(rid, 413, f"request body larger than {MAX_BODY} bytes")
+            return False
+        if flags & END:
+            del self.open[rid]
+            return self.finish(req)
+        return False
+
+    def serve(self):
+        log(f"{self.tag()} OPEN")
+        reason = "client closed"
+        try:
+            try:
+                pre = self.read_exact(8, time.monotonic() + FRAME_TIMEOUT)
+            except Closed:
+                reason = "closed before preface"
+                return
+            if pre != PREFACE:
+                reason = f"bad preface {pre!r}"
+                body = b"This server speaks BHTTP/1, a binary protocol. See SPEC.md.\n"
+                self.send(b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+                          b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+                return
+            self.send(PREFACE)
+            while True:
+                try:
+                    length, ftype, flags, rid, deadline = self.read_header()
+                except Closed:
+                    break
+                if length > MAX_FRAME:
+                    self.goaway(FRAME_TOO_LARGE, f"frame of {length} bytes, limit {MAX_FRAME}")
+                    reason = "frame too large"
+                    break
+                if ftype not in (HEADERS, DATA, GOAWAY):
+                    self.skip(length, deadline)
+                    log(f"{self.tag()} skipped unknown frame type 0x{ftype:02X} ({length} bytes)")
+                    continue
+                payload = self.read_exact(length, deadline)
+                if ftype == GOAWAY:
+                    reason = "client sent GOAWAY"
+                    break
+                if rid == 0:
+                    self.goaway(PROTOCOL_ERROR, "HEADERS or DATA on request id 0")
+                    reason = "protocol error"
+                    break
+                try:
+                    handler = self.on_headers if ftype == HEADERS else self.on_data
+                    if handler(rid, flags, payload):
+                        self.goaway(NO_ERROR, "connection: close")
+                        reason = "connection: close"
+                        break
+                except Malformed as e:
+                    self.goaway(PROTOCOL_ERROR, str(e))
+                    reason = "protocol error"
+                    break
+        except Timeout as t:
+            if t.idle:
+                self.goaway(NO_ERROR, f"idle for {IDLE_TIMEOUT:g}s")
+                reason = "idle timeout"
+            else:
+                self.goaway(TIMEOUT, f"frame not finished within {FRAME_TIMEOUT:g}s")
+                reason = "frame timeout"
+        except Closed:
+            reason = "client vanished mid-frame"
+        except OSError as e:
+            reason = f"socket error: {e}"
+        finally:
+            try:
+                self.sock.shutdown(socket.SHUT_WR)
+                self.sock.settimeout(1.0)
+                end = time.monotonic() + 2.0
+                while time.monotonic() < end and self.sock.recv(65536):
+                    pass
+            except OSError:
+                pass
+            self.sock.close()
+            log(f"{self.tag()} CLOSE after {self.served} response(s) - {reason}")
+
+
+def listen(host, port):
+    sel = selectors.DefaultSelector()
+    for fam, typ, proto, _, addr in socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE):
+        s = socket.socket(fam, typ, proto)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if fam == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            s.bind(addr)
+        except OSError as e:
+            log(f"cannot bind {addr[0]}:{addr[1]}: {e}")
+            s.close()
+            continue
+        s.listen(128)
+        sel.register(s, selectors.EVENT_READ)
+        log(f"listening on {addr[0]}:{addr[1]}")
+    if not sel.get_map():
+        sys.exit(f"could not listen on {host}:{port}")
+    return sel
+
+
+def main():
+    global IDLE_TIMEOUT, FRAME_TIMEOUT, GREASE, FAIL_FIRST
+    ap = argparse.ArgumentParser(prog="bserve", description="BHTTP/1 file server")
+    ap.add_argument("root")
+    ap.add_argument("port", type=int)
+    ap.add_argument("--host", default="localhost")
+    ap.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT)
+    ap.add_argument("--frame-timeout", type=float, default=FRAME_TIMEOUT)
+    ap.add_argument("--grease", action="store_true",
+                    help="send an unknown frame type before every response")
+    ap.add_argument("--fail-first", type=int, default=0, metavar="N",
+                    help="answer the first N requests with 503, to exercise client retries")
+    opts = ap.parse_args()
+    IDLE_TIMEOUT, FRAME_TIMEOUT, GREASE = opts.idle_timeout, opts.frame_timeout, opts.grease
+    FAIL_FIRST = opts.fail_first
+    root = os.path.realpath(opts.root)
+    if not os.path.isdir(root):
+        sys.exit(f"bserve: {opts.root} is not a directory")
+    sel = listen(opts.host, opts.port)
+    log(f"serving {root}  idle-timeout={IDLE_TIMEOUT:g}s" + ("  grease=on" if GREASE else ""))
+    try:
+        while True:
+            for key, _ in sel.select():
+                try:
+                    sock, peer = key.fileobj.accept()
+                except OSError:
+                    continue
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn = Connection(sock, peer, root)
+                threading.Thread(target=conn.serve, daemon=True).start()
+    except KeyboardInterrupt:
+        log("bye")
+
+
+if __name__ == "__main__":
+    main()
